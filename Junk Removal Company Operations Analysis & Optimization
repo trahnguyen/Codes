@@ -1,0 +1,340 @@
+# Data Cleaning
+## Load Data
+Load packages:
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(psych)
+library(stringr)
+library(tidygeocoder)
+library(dplyr)
+library(textclean)
+library(qdapRegex)
+library(Hmisc)
+library(lavaan)
+library(geosphere)
+library(readxl)
+library(tidyr)
+library(magrittr)
+```
+
+We will be using Workiz Jobs 2021 & 2022, Gusto Employee Data, and COGs & Marketing datasets. 
+Load data and merge Workiz Jobs 2021 & 2022:
+```{r}
+w_jobs_21 <- read.csv("~/Babson/MSB Field Project/Data/data_230125/Workiz Jobs 2021.csv")
+w_jobs_22 <- read.csv("~/Babson/MSB Field Project/Data/data_230125/Workiz Jobs 2022.csv")
+w_jobs = rbind(w_jobs_21,w_jobs_22)
+employee <- read.csv("~/Babson/MSB Field Project/Data/data_230125/Gusto Employee Data.csv")
+cogs <- read_excel("~/Babson/MSB Field Project/Data/data_230125/G.I. Junk Removal - COGs & Marketing.xlsx")
+```
+
+## Clean Workiz Jobs
+Our analysis will be based on jobs done. We first categorized 'Status' column to 'Done', 'Canceled', and 'Scheduled' and removed canceled jobs. Then we converted 'Type', 'Status','City', 'State', 'Metro.Area', 'Source' to their appropriate variable types. 
+
+```{r}
+w_jobs = w_jobs %>% 
+  mutate(done = if_else(Status == 'Done', 1, 0)) %>%
+  mutate(Status = str_sub(Status, end = 9)) %>%
+  mutate(Status = str_replace_all(Status, "@", "")) %>%
+  mutate(Status = gsub("[(]", "", Status)) %>%
+  mutate(Status = gsub("Don", "Done", Status)) %>%
+  mutate(Status = gsub("Donee", "Done", Status)) %>%
+  mutate(Status = gsub("Canceled ", "Canceled", Status)) %>%
+  mutate(Status = gsub("Done Done", "Done", Status))
+
+fct_cols = c("Type","Status","City","State","Metro.Area", "Source")
+w_jobs = w_jobs %>% 
+  mutate_at(fct_cols, as.factor) %>% 
+  mutate(Created = mdy_hm(Created)) %>%
+  mutate(Scheduled = mdy_hm(Scheduled)) %>%
+  mutate(End = mdy_hm(End)) %>% 
+  mutate(end_date = format(End, "%Y-%m"))
+
+w_jobs = droplevels(w_jobs[!w_jobs$Status == 'Canceled',])
+```
+
+We then cleaned 'Type' and 'Client' columns by removing administrative note related jobs and jobs noted as 'Quote Only' in 'Type' and 'Total' = 0 (which means no revenue generated).
+```{r}
+w_jobs = droplevels(w_jobs[!w_jobs$Type %in% c("Event", "1 Truck Available", "2 Trucks Available", "NO SALEM w_jobs TODAY"),])
+w_jobs = w_jobs[!grepl('(Available Truck).*', w_jobs$Client),]
+w_jobs = w_jobs[!grepl('(Administrative).*', w_jobs$Client),]
+w_jobs = w_jobs[!grepl('(Test).*', w_jobs$Client),]
+w_jobs = droplevels(subset(w_jobs, !(Total == 0 & Type == 'Quote Only')))
+```
+
+Remove possible duplications.
+```{r}
+w_jobs = distinct(w_jobs)
+```
+
+We categorized 'Service Type' to "Small Load", "Medium Load", "Large Load", "XLarge Load", "XLarge +", and "Other" based on the new price ranges.
+```{r}
+w_jobs <- subset(w_jobs, !(Total == 0))
+w_jobs$Type <- ifelse(w_jobs$Total >= 1 & w_jobs$Total <= 275, "Small Load",
+                     ifelse(w_jobs$Total > 275 & w_jobs$Total <= 375, "Medium Load",
+                            ifelse(w_jobs$Total > 375 & w_jobs$Total <= 525, "Large Load",
+                                   ifelse(w_jobs$Total > 525 & w_jobs$Total <= 775, "XLarge Load",
+                                          ifelse(w_jobs$Total > 775, "XLarge +", "Other")))))
+w_jobs$Type <- as.factor(w_jobs$Type)
+```
+
+## Create new variables
+### Truck count and truck names
+We counted number of trucks per job and seperated truck names in 'Tech' column and stored in 2 new columns called 'Truck' and 'truck_combinations'. We also removed jobs with no trucks (truck count = 0).
+```{r}
+w_jobs$truck_count <- str_count(w_jobs$Tech, "Truck")
+
+words <- c("Patriot Truck","Husky Truck",
+           "Enterprise Truck","Intruder Truck",
+           "Vulcan Truck")
+w_jobs <- w_jobs %>% mutate(truck_combinations = str_extract_all(w_jobs$Tech, paste(words, collapse="|")))
+w_jobs <- w_jobs %>% 
+  mutate(truck_combinations = sapply(w_jobs$truck_combinations, paste, collapse = ","))
+w_jobs$truck_combinations = as.factor(w_jobs$truck_combinations)
+```
+
+### Staff count
+We counted number of employees per job stored in a new columns called 'staff_count'.
+```{r}
+w_jobs$staff_count <- sapply(strsplit(as.character(w_jobs$Tech), ","), 
+                            function(x) sum(!trimws(x) %in% words))
+```
+
+### Duration per Job
+We first calculated duration per job by subtracting the scheduled and end time of a job. All durations are measured in hours. Then, we removed all jobs with durations less than 3 minutes (0.05 hours). 
+
+For jobs done in multiple days (17 hours), we deducted 10 hours per day from the total duration per job, assuming that max working duration per day is 14 hours. Finally, we excluded durations outliers that are jobs with over 172.8970 hours (from 99.7 quantile).
+
+```{r}
+w_jobs$Duration <- as.numeric(difftime(w_jobs$End, w_jobs$Scheduled, units = "hours"))
+
+subset_w_jobs <- subset(w_jobs, Duration >= 17)
+subset_w_jobs$Duration_Deducted <- subset_w_jobs$Duration - (floor(subset_w_jobs$Duration / 24) * 10)
+new_duration_df <- data.frame(Job.. = subset_w_jobs$Job.., Duration = subset_w_jobs$Duration_Deducted)
+w_jobs <- merge(w_jobs, new_duration_df, by = "Job..", all.x = TRUE)
+w_jobs$Duration <- ifelse(!is.na(w_jobs$Duration.y), w_jobs$Duration.y, w_jobs$Duration.x)
+w_jobs <- subset(w_jobs, select = -c(Duration.x, Duration.y))
+
+w_jobs_Duration_quantiles = quantile(w_jobs$Duration, probs = seq(0, 1, by = 0.001))
+Duration_threshold <- quantile(w_jobs$Duration, probs = 0.997)
+w_jobs <- subset(w_jobs, Duration <= Duration_threshold)
+
+```
+
+### Longitude and Latititude
+To get the distance from one job to another, we cleaned uniformed the city names in the 'City' column. Then, we generated the geocodes to get the latitude and longitude from the new 'Full_Address' column ('Address' and 'City' combined).
+```{r}
+city_replacements <- c("Albany", "Aloha", "Beavercreek", "Beaverton", "Boring", "Camas", "Canby", "Clackamas", "Damascus", "Eagle Creek", "Gresham", "Happy Valley", "Hillsboro", "King City", "Lake Oswego", "Milwaukie", "Oregon City", "Portland", "Rickreall", "Salem", "Tigard", "Tualatin", "Vancouver", "West Linn", "Wilsonville", "Wood Village")
+for (i in 1:length(city_replacements)) {
+  pattern <- paste0("(?i)\\b", city_replacements[i], "\\b")
+  w_jobs$City <- gsub(pattern, city_replacements[i], w_jobs$City, perl=TRUE)
+}
+w_jobs$Full_Address <- paste(w_jobs$Address, w_jobs$City, sep=", ")
+
+#lat_longs <- w_jobs %>% geocode(Full_Address, method = 'osm', lat = latitude , long = longitude)
+```
+
+```{r}
+#write.csv(lat_longs, "~/Babson/MSB Field Project/Final/Workiz Jobs_LatLong.csv")
+```
+
+```{r}
+w_jobs <- read.csv("~/Babson/MSB Field Project/Final/Workiz Jobs_LatLong.csv")
+```
+
+### Fuel Cost
+To calculate profit per job, we will have 3 biggest components: Fuel Cost, Labor Cost, and Waste Diposal Fee. We will calcukate the average fuel cost per job based on the monthly fuel cost in COGs & Marketing file, divided by number of jobs in that month.
+
+```{r}
+jobsmonth = w_jobs%>% filter(Total != 0) %>%
+  group_by(end_date) %>%
+  summarise(job_count=n())
+
+trans_cogs <- t(cogs)
+colnames(trans_cogs) <- trans_cogs[1,]
+trans_cogs <- trans_cogs[-c(1,2),]
+rownames(trans_cogs)[rownames(trans_cogs) == "Feb 1-20, 2023"] <- "Feb 2023"
+for (i in seq_along(rownames(trans_cogs))) {
+  if (rownames(trans_cogs)[i] != "Total") {
+    rownames(trans_cogs)[i] <- format(mdy(rownames(trans_cogs)[i]), "%Y-%m")
+  }
+}
+
+cogs_jobsmonth_joined <- merge(trans_cogs, jobsmonth, by.x = "row.names", by.y = "end_date")
+cogs_jobsmonth_joined$Fuel = as.numeric(cogs_jobsmonth_joined$Fuel)
+cogs_jobsmonth_joined$average_fuel_cost = cogs_jobsmonth_joined$Fuel / cogs_jobsmonth_joined$job_count
+
+w_jobs_2 <- merge(w_jobs, cogs_jobsmonth_joined[, c('Row.names', 'average_fuel_cost')], 
+               by.x = "end_date", by.y = "Row.names", all.x = TRUE)
+```
+
+### Employees and Labor Cost
+To calculate labor cost per job, we get the hourly wage from the Gusto Employee Data file and multiply by the duration calculated above. 
+We combined first and last names in Gusto Employee Data and stored in a new column called 'employee_list' and converted all compensations to hourly wage.
+
+```{r}
+employee$employee_list <- paste(employee$First.name, employee$Last.name, sep = " ")
+
+names(employee)[10] <- "compensation_amount"
+names(employee)[11] <- "compensation_period"
+employee$hourly_wage <- ifelse(employee$compensation_period == "Year",
+                               employee$compensation_amount / (52 * 40),
+                               ifelse(employee$compensation_period == "Month",
+                                      employee$compensation_amount / (4 * 40),
+                                      employee$compensation_amount))
+```
+
+To obtain the list of employees who worked in certain jobs, we extracted the 'Tech' column and standardized the spelling of the job names. Then we joined the dataframe with the Gusto Employee Data dataframe to get the hourly salary for each corresponding employee and store in the new column 'labor_cost_hourly'. We removed jobs with no employees or no trucks.
+
+```{r}
+w_jobs_2 <- w_jobs_2 %>% 
+  mutate(employee_name = str_remove_all(Tech, paste(words, collapse="|"))) %>%
+  mutate(employee_name = str_replace(employee_name, "^,", "")) %>% 
+  mutate(employee_name = str_replace_all(employee_name, "(,+|^,|,$)", ",")) %>% 
+  mutate(employee_name = str_replace(employee_name, ",+$", ""))
+
+w_jobs_2 <- subset(w_jobs_2, truck_count != 0)
+
+w_jobs_3 <- w_jobs_2 %>%
+  mutate(employee_list = strsplit(as.character(employee_name), ",\\s*|,")) %>%
+  tidyr::unnest(cols = employee_list) %>%
+  mutate(employee_list = gsub("\\s{2,}", " ", trimws(employee_list))) %>%
+  mutate(employee_list = ifelse(employee_list == "Ron Kirk", "Ronald Kirk", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "William T Salisbury", "William Salisbury", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Bill Hammond", "William Hammond", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Hunter Von Plueren", "Hunter Vonplueren", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Shaun Thompson", "Shaunquel Thompson", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Logan Coen", "Phillip Coen", employee_list)) %>% 
+  mutate(employee_list = ifelse(employee_list == "Abby Lozano", "Abigaihtd Lozano", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Bob Stricklin", "Robert Stricklin", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Cat Lipe", "Cathy Lipe", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Xander Delsing", "Alexander Delsing", employee_list)) %>%
+  mutate(employee_list = ifelse(employee_list == "Alex Tercero", "Ervin Tercero", employee_list))
+
+labor_cost_hourly <- w_jobs_3 %>%
+  left_join(employee, by = "employee_list") %>%
+  select(Job.., Tech, employee_list,hourly_wage,compensation_period)
+
+sum(!complete.cases(labor_cost_hourly))
+labor_cost_hourly %>%
+  group_by(employee_list) %>%
+  summarise(n_NA = sum(is.na(hourly_wage))) %>%
+  print(n=Inf)
+
+labor_cost_hourly <- na.omit(labor_cost_hourly)
+
+labor_cost_hourly <- labor_cost_hourly %>%
+  group_by(Job..) %>%
+  summarise(labor_cost_hourly = sum(hourly_wage))
+
+w_jobs_2 <- w_jobs_2 %>%
+  left_join(labor_cost_hourly, by = "Job..")
+
+w_jobs_2$labor_cost <- w_jobs_2$Duration * w_jobs_2$labor_cost_hourly
+
+w_jobs_2 %>%
+  group_by(Job.., Tech) %>%
+  summarise(n_NA = sum(is.na(labor_cost_hourly))) %>%
+  filter(n_NA > 0) %>%
+  print(n=Inf)
+
+```
+
+### Data Cleaning 
+To order employee names in a uniform format, we took the "employee_name" column, separated by commas, and split them into eight separate columns. We then sorted and concatenated the names, and then combined them back into a single column. The eight name columns are then removed from the data frame.
+
+```{r}
+w_jobs_2$employee_name = as.factor(w_jobs_2$employee_name)
+
+w_jobs_2 <- w_jobs_2 %>%
+  mutate(employee_name = str_trim(employee_name)) %>%
+  separate(employee_name, into = paste0("name", 1:8), sep = ",", fill = "right") 
+
+w_jobs_2 <- w_jobs_2 %>%
+  mutate(
+    Crews = apply(w_jobs_2[, c("name1", "name2", "name3", "name4", "name5", "name6", "name7", "name8")], 1, function(x) paste(sort(x), collapse = ", "))
+  ) %>%
+  select(-c("name1", "name2", "name3", "name4", "name5", "name6", "name7", "name8"))
+```
+
+Convert factor columns to the correct data type, and then converting date-time columns to a standard format.
+
+```{r}
+
+w_jobs_2 <- w_jobs_2 %>% 
+  mutate_at(fct_cols, as.factor) %>% 
+  mutate(Created = ymd_hms(Created)) %>%
+  mutate(Scheduled = ymd_hms(Scheduled)) %>%
+  mutate(End = ymd_hms(End)) 
+```
+
+### Duration 
+Calculated the duration of work for each unique combination of "Crews" and "Date" by subtracting the earliest "Scheduled" time from the latest "End" time for each group, and storing the result in a new column. 
+
+```{r}
+w_jobs_2 <- w_jobs_2 %>%
+  mutate(Date = as.Date(Scheduled)) %>%
+  group_by(Crews, Date) %>%
+  mutate(Duration_Workday = as.numeric(gsub(" hours", "", difftime(max(End), min(Scheduled), units = "hours"))))
+```
+
+### Gap Time
+Calculated the gap time between the end of one job and the start of the next job for each crew and each day. Then, we calculated the average gap time for each crew, and counted the number of negative gap times in the original data frame. NOTE: Negative gap times indicate that there was overlap between jobs.
+
+```{r}
+w_jobs_2 <- w_jobs_2 %>%
+  group_by(Crews, Date) %>%
+  arrange(End) %>%
+  mutate(Gap_Time = (Scheduled - lag(End)) / 60)
+
+w_jobs_2$Gap_Time = as.numeric(w_jobs_2$Gap_Time)
+result = w_jobs_2 %>% group_by(Crews) %>% summarise(avg_gap_time = mean(Gap_Time, na.rm = TRUE)) %>% arrange(Crews)
+sum(w_jobs_2$Gap_Time < 0, na.rm = TRUE)
+```
+
+### Distance
+
+We computed the total distance traveled by each crew to complete their jobs, and removeed any rows where the total distance traveled is in the top 0.5 percentile. The distance is calculated as the distance between the current latitude/longitude and the previous latitude/longitude. If it's the first row for a crew or if the distance between jobs is smaller than 0, the distance is calculated as the distance between the headquarters and the current latitude/longitude.
+
+```{r}
+w_jobs_2$GI_lat = as.numeric('45.3301306')
+w_jobs_2$GI_long = as.numeric('-122.5553038')
+
+w_jobs_2 <- w_jobs_2 %>%  
+  mutate(prev_lat = lag(latitude), 
+         prev_lon = lag(longitude),
+         dist_miles = ifelse(!is.na(prev_lat), 
+                             distGeo(cbind(prev_lon, prev_lat),
+                                     cbind(longitude, latitude)) * 0.000621371, 0),
+         dist_from_GI_miles = ifelse(row_number() == 1, 
+                                     distGeo(cbind(GI_long, GI_lat),
+                                             cbind(longitude, latitude)) * 0.000621371, 0)) %>% 
+  ungroup()
+
+w_jobs_2 <- w_jobs_2 %>%
+  mutate(total_dist_miles = ifelse(dist_miles > 0, dist_miles, dist_from_GI_miles)) %>%
+  select(-prev_lat, -prev_lon, -dist_miles, -dist_from_GI_miles)
+
+ggplot(w_jobs_2, aes(x = total_dist_miles)) +
+  geom_histogram(binwidth = 10, fill = "cornflowerblue", color = "blue") +
+  labs(title = "Total Distance Traveled", x = "Distance (miles)", y = "Count")
+
+describe(w_jobs_2$total_dist_miles, na.rm = TRUE, interp=FALSE,skew = TRUE, ranges = TRUE,trim=.05,
+         type=3,check=TRUE,fast=NULL,quant=NULL,IQR=FALSE,omit=FALSE,data=NULL)
+
+percentiles = seq(75, 100, by = 0.1)
+for (i in percentiles) {
+  print(paste(i, "percentile value:", quantile(w_jobs_2$total_dist_miles, probs = i/100, na.rm = TRUE)))
+}
+pct_value <- quantile(w_jobs_2$total_dist_miles, 0.995, na.rm = TRUE)
+w_jobs_2 <- w_jobs_2 %>%
+  filter(total_dist_miles <= pct_value)
+```
+
+
+## Export Final CSV
+```{r}
+w_jobs = w_jobs_2
+write.csv(w_jobs, "~/Babson/MSB Field Project/Final/Workiz Jobs_Cleaned_Final.csv")
+```
